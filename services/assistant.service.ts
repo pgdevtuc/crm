@@ -110,9 +110,16 @@ export class AssistantService {
                 return { finalText: text ?? '', updatedTranscript: transcript };
             }
 
-            // Para Responses API, NO agregamos el mensaje del asistente con tool_calls
-            // En su lugar, agregamos directamente los tool results
-            // El modelo infiere las tool calls del output anterior
+            // CRÍTICO: Primero agregar los function_call del response al input
+            // OpenAI necesita ver el function_call antes del function_call_output
+            const out = response?.output;
+            if (Array.isArray(out)) {
+                for (const item of out) {
+                    if (item?.type === 'function_call') {
+                        input.push(item); // Agregar el function_call completo tal cual
+                    }
+                }
+            }
             
             console.log(`\n🔧 Executing ${toolCalls.length} tool(s)...`);
             const toolResults: DBMessage[] = [];
@@ -135,7 +142,7 @@ export class AssistantService {
                     name,
                 });
 
-                // Para Responses API, el formato correcto es 'function_call_output'
+                // Ahora sí, agregar el function_call_output
                 input.push({
                     type: 'function_call_output',
                     call_id: tool_call_id,
