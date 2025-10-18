@@ -96,7 +96,24 @@ export function ContactList({
                 <h3 className="font-semibold text-[#111b21] truncate">{contact.name}</h3>
                 <span className="text-xs text-[#667781] ml-2">{formatDate(contact.timestamp)}</span>
               </div>
-              <p className="text-sm text-[#667781] truncate">{contact.lastMessage == '[image]' ? (<><CameraIcon className="w-4 h-4 inline-block" /><p>imagen</p></>) : contact.lastMessage == '[audio]' ? (<><Mic className="w-4 h-4 inline-block" /><p>audio</p></>) : contact.lastMessage}</p>
+              <div className="text-sm text-[#667781] truncate">
+                {contact.lastMessage === '[image]' ? (
+                  <span className="inline-flex items-center gap-1">
+                    <CameraIcon className="w-4 h-4" aria-hidden="true" />
+                    <span>imagen</span>
+                  </span>
+                ) : contact.lastMessage === '[audio]' ? (
+                  <span className="inline-flex items-center gap-1">
+                    <Mic className="w-4 h-4" aria-hidden="true" />
+                    <span>audio</span>
+                  </span>
+                ) : (
+                  <span className="truncate inline-block max-w-full align-bottom">
+                    {contact.lastMessage}
+                  </span>
+                )}
+              </div>
+
             </div>
           </div>
         ))}
