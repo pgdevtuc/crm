@@ -166,7 +166,7 @@ export async function POST(request: NextRequest) {
       const { kind, media } = mediaInfo;
 
       // 1) obtener URL temporal (usa la del webhook si viene, si no, resuelve por /{media-id})
-      let mediaUrl = media.url;
+      let mediaUrl = null;//media.url;
       let mime = media.mime_type;
       if (!mediaUrl) {
         const resolved = await resolveMediaUrl(media.id);
