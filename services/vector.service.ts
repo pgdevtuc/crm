@@ -1,6 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { OpenAI } from 'openai';
-
+import { connectDB } from '@/lib/mongodb';
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
@@ -9,6 +9,12 @@ const supabase = createClient(
   process.env.SUPABASE_URL || '',
   process.env.SUPABASE_KEY || ''
 );
+
+connectDB().then(() => {
+  console.log('✅ Conectado a la base de datos para VectorService');
+}).catch((err) => {
+  console.error('❌ Error conectando a la base de datos para VectorService:', err);
+});
 
 export class VectorService {
 

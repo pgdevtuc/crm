@@ -6,501 +6,515 @@ import vectorService from '@/services/vector.service';
 import { system_message } from '../lib/const';
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
+    apiKey: process.env.OPENAI_API_KEY!,
 });
 
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 type Role = 'system' | 'user' | 'assistant' | 'tool';
 
-// Estructura mínima para nuestra BD
 type DBMessage = {
-  role: Role;
-  content: string;
-  timestamp: Date;
-  // opcional: guarda metadatos de tool calls/resultados
-  tool_call_id?: string;
-  name?: string; // nombre de la función si role==='tool'
+    role: Role;
+    content: string;
+    timestamp: Date;
+    tool_call_id?: string;
+    name?: string;
 };
 
 export class AssistantService {
 
-  async getOrCreateThread(userId: string): Promise<string> {
-    let user = await User.findOne({ userId });
-    if (!user) user = await User.create({ userId });
+    async getOrCreateThread(userId: string): Promise<string> {
+        let user = await User.findOne({ userId });
+        if (!user) user = await User.create({ userId });
 
-    if (user.threadId) return user.threadId;
+        if (user.threadId) return user.threadId;
 
-    const thread = await Thread.create({
-      userId: user.userId,
-      threadId: cryptoRandomId(),
-      assistantId: 'responses-api', // informativo
-      messages: [],
-    });
+        const thread = await Thread.create({
+            userId: user.userId,
+            threadId: cryptoRandomId(),
+            assistantId: 'responses-api',
+            messages: [],
+        });
 
-    user.threadId = thread.threadId;
-    await user.save();
+        user.threadId = thread.threadId;
+        await user.save();
 
-    return thread.threadId;
-  }
+        return thread.threadId;
+    }
 
+    async sendMessage(userId: string, message: string): Promise<string> {
+        const threadId = await this.getOrCreateThread(userId);
 
-  async sendMessage(userId: string, message: string): Promise<string> {
-    const threadId = await this.getOrCreateThread(userId);
+        const history = await this.loadHistory(threadId, 30);
+        const input = this.buildInput(history, message);
+        const tools = this.getToolDefs();
 
-    // 1) Traer historial y “ventanear” (p.ej. últimas 30 entradas)
-    const history = await this.loadHistory(threadId, 30);
+        const { finalText, updatedTranscript } =
+            await this.runWithToolsLoop({ input, tools });
 
-    // 2) Construir input para Responses: system + historial + nuevo user
-    const input = this.buildInput(history, message);
+        await this.appendToThread(threadId, [
+            { role: 'user', content: message, timestamp: new Date() },
+            ...updatedTranscript,
+        ]);
 
-    // 3) Definir tools (functions) disponibles en esta llamada
-    const tools = this.getToolDefs();
+        return finalText;
+    }
 
-    // 4) Loop de tool-calling hasta que obtengamos texto final
-    const { finalText, updatedTranscript } =
-      await this.runWithToolsLoop({ input, tools });
-
-    // 5) Persistir en BD: user msg + assistant msg
-    await this.appendToThread(threadId, [
-      { role: 'user', content: message, timestamp: new Date() },
-      ...updatedTranscript, // incluye tool results y la respuesta final
-    ]);
-
-    return finalText;
-  }
-
-  /**
-   * Ejecuta Responses API y resuelve tool calls hasta respuesta final
-   */
-  private async runWithToolsLoop({
-    input,
-    tools,
-    maxToolPasses = 5,
-  }: {
-    input: any[];
-    tools: any[];
-    maxToolPasses?: number;
-  }): Promise<{ finalText: string; updatedTranscript: DBMessage[] }> {
-    let transcript: DBMessage[] = [];
-    let passes = 0;
-
-    // Bucle: request → ¿tool calls? → ejecutar → inyectar resultados → repetir
-    while (passes < maxToolPasses) {
-      const response = await openai.responses.create({
-        model: MODEL,
+    private async runWithToolsLoop({
         input,
-        instructions: system_message,
         tools,
-        tool_choice: 'auto',
-      });
+        maxToolPasses = 5,
+    }: {
+        input: any[];
+        tools: any[];
+        maxToolPasses?: number;
+    }): Promise<{ finalText: string; updatedTranscript: DBMessage[] }> {
+        let transcript: DBMessage[] = [];
+        let passes = 0;
 
-      // 1) ¿Hay texto final?
-      const text = safeOutputText(response);
-      // 2) ¿Hay tool calls?
-      const toolCalls = extractToolCalls(response);
+        while (passes < maxToolPasses) {
+            console.log(`\n🔄 Tool Loop - Pass ${passes + 1}`);
+            console.log(`📋 Input messages count: ${input.length}`);
+            console.log(`📋 Last user message:`, input.filter(m => m.role === 'user').slice(-1)[0]?.content?.substring(0, 100));
+            console.log(`🔧 Tools available:`, tools.map(t => t.name));
+            
+            const response = await openai.responses.create({
+                model: MODEL,
+                input,
+                instructions: system_message,
+                tools,
+            });
 
-      if (!toolCalls.length) {
-        // No hay tools; tenemos texto final (o texto vacío pero sin tools)
+            // Log completo de la respuesta para debugging
+            console.log(`\n📦 Full response output:`, JSON.stringify(response.output, null, 2));
+            console.log(`\n📦 Response metadata:`, {
+                id: response.id,
+                status: response.status,
+                model: response.model,
+                hasOutput: !!response.output,
+                outputLength: Array.isArray(response.output) ? response.output.length : 0
+            });
+
+            const text = safeOutputText(response);
+            const toolCalls = extractToolCalls(response);
+
+            console.log(`📤 Response text: ${text?.substring(0, 100) || '(none)'}...`);
+            console.log(`🔧 Tool calls detected: ${toolCalls.length}`);
+
+            if (!toolCalls.length) {
+                transcript.push({
+                    role: 'assistant',
+                    content: text ?? '',
+                    timestamp: new Date(),
+                });
+                return { finalText: text ?? '', updatedTranscript: transcript };
+            }
+
+            // Para Responses API, NO agregamos el mensaje del asistente con tool_calls
+            // En su lugar, agregamos directamente los tool results
+            // El modelo infiere las tool calls del output anterior
+            
+            console.log(`\n🔧 Executing ${toolCalls.length} tool(s)...`);
+            const toolResults: DBMessage[] = [];
+
+            for (const call of toolCalls) {
+                const { id: tool_call_id, name, arguments: args } = call;
+                console.log(`\n🔧 Executing tool: ${name}`);
+                console.log(`📝 Arguments: ${args.substring(0, 100)}...`);
+                
+                const parsedArgs = safeJsonParse(args) ?? {};
+                const output = await this.executeFunction(name, parsedArgs);
+
+                console.log(`✅ Tool result: ${JSON.stringify(output).substring(0, 100)}...`);
+
+                toolResults.push({
+                    role: 'tool',
+                    content: JSON.stringify(output),
+                    timestamp: new Date(),
+                    tool_call_id,
+                    name,
+                });
+
+                // Para Responses API, el formato correcto es 'function_call_output'
+                input.push({
+                    type: 'function_call_output',
+                    call_id: tool_call_id,
+                    output: JSON.stringify(output),
+                });
+            }
+
+            transcript.push(...toolResults);
+            passes += 1;
+        }
+
         transcript.push({
-          role: 'assistant',
-          content: text ?? '',
-          timestamp: new Date(),
+            role: 'assistant',
+            content: 'No pude completar la tarea porque se superó el máximo de pasos de herramientas.',
+            timestamp: new Date(),
         });
-        return { finalText: text ?? '', updatedTranscript: transcript };
-      }
-
-      // Tenemos una o más tool calls → ejecutarlas
-      const toolResults: DBMessage[] = [];
-
-      for (const call of toolCalls) {
-        const { id: tool_call_id, name, arguments: args } = call;
-        const parsedArgs = safeJsonParse(args) ?? {};
-        const output = await this.executeFunction(name, parsedArgs);
-
-        // Guardamos el “tool result” en el transcript y lo reinyectamos al modelo
-        toolResults.push({
-          role: 'tool',
-          content: JSON.stringify(output),
-          timestamp: new Date(),
-          tool_call_id,
-          name,
-        });
-
-        // En Responses API “reinyectas” el resultado como parte del **input**
-        input.push({
-          role: 'tool',
-          content: JSON.stringify(output),
-          tool_call_id,
-          name,
-        });
-      }
-
-      transcript.push(...toolResults);
-      passes += 1;
-
-      // En la siguiente iteración, el modelo ve los tool results y produce texto final
-      // (o vuelve a pedir otra tool).
-    }
-
-    // Si salimos por límite de pases, devolvemos lo último que tengamos
-    transcript.push({
-      role: 'assistant',
-      content:
-        'No pude completar la tarea porque se superó el máximo de pasos de herramientas.',
-      timestamp: new Date(),
-    });
-    return {
-      finalText:
-        'No pude completar la tarea porque se superó el máximo de pasos de herramientas.',
-      updatedTranscript: transcript,
-    };
-  }
-
-  /** Construcción del input: system + historial + mensaje actual */
-  private buildInput(history: DBMessage[], userMessage: string) {
-    const input: any[] = [];
-
-    // 1) Siempre un system al inicio (breve)
-    if (system_message) {
-      input.push({ role: 'system', content: system_message });
-    }
-
-    // 2) Historial (user/assistant/tool)
-    for (const m of history) {
-      const base = { role: m.role, content: m.content } as any;
-      if (m.role === 'tool') {
-        // Con Responses, conviene incluir tool_call_id y name si lo tienes
-        if (m.tool_call_id) base.tool_call_id = m.tool_call_id;
-        if (m.name) base.name = m.name;
-      }
-      input.push(base);
-    }
-
-    // 3) Mensaje del usuario
-    input.push({ role: 'user', content: userMessage });
-
-    return input;
-  }
-
-  /** Trae mensajes del thread y devuelve los últimos N */
-  private async loadHistory(threadId: string, max = 30): Promise<DBMessage[]> {
-    const thread = await Thread.findOne({ threadId });
-    if (!thread) return [];
-    const messages = (thread.messages || []) as DBMessage[];
-    return messages.slice(-max);
-  }
-
-  /** Inserta mensajes en el thread */
-  private async appendToThread(threadId: string, messages: DBMessage[]) {
-    await Thread.findOneAndUpdate(
-      { threadId },
-      { $push: { messages: { $each: messages } } },
-      { upsert: true }
-    );
-  }
-
-  /** Definición de tools (functions) para Responses API */
-  private getToolDefs() {
-    return [
-      {
-        type: 'function',
-        function: {
-          name: 'InfoInstitucional',
-          description:
-            'Información sobre: servicios, profesionales, matrículas, cobertura, responsables, ubicación, procesos, horarios, datos de contacto.',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: {
-                type: 'string',
-                description:
-                  'La consulta de búsqueda. Debe ser específica y descriptiva.',
-              },
-              limit: {
-                type: 'number',
-                description:
-                  'Número máximo de resultados a retornar (default: 5)',
-                default: 5,
-              },
-              filter: {
-                type: 'object',
-                description:
-                  'Filtros opcionales por metadata. Ej: {"empresa":"manzotti","info":"institucional"}',
-                properties: {},
-                additionalProperties: true,
-              },
-            },
-            required: ['query'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'Propiedades',
-          description: 'Busca propiedades en la base de datos.',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: {
-                type: 'string',
-                description:
-                  'La consulta de búsqueda. Debe ser específica y descriptiva.',
-              },
-              limit: {
-                type: 'number',
-                description:
-                  'Número máximo de resultados a retornar (default: 5)',
-                default: 5,
-              },
-              filter: {
-                type: 'object',
-                description:
-                  'Filtros opcionales por metadata. Ej: {"empresa":"manzotti"}',
-                properties: {},
-                additionalProperties: true,
-              },
-            },
-            required: ['query'],
-          },
-        },
-      },
-    ];
-  }
-
-  // ---------- Function calling: ejecutor de funciones ----------
-  private async executeFunction(name: string, args: any): Promise<any> {
-    console.log(`🔧 Ejecutando función: ${name} con parámetros`, args);
-    switch (name) {
-      case 'InfoInstitucional':
-        return this.getInfoInstitucional(args.query, args.limit);
-
-      case 'Propiedades':
-        return this.getPropiedades(args.query, args.limit);
-
-      default:
-        return { error: `Función ${name} no implementada` };
-    }
-  }
-
-  // ---------- Tus funciones de negocio ----------
-  private async getInfoInstitucional(query: string, limit: number = 5) {
-    try {
-      console.log(`🔍 Buscando en knowledge base: "${query}"`);
-      const results = await vectorService.searchSimilarDocuments(query, limit, {
-        empresa: 'manzotti',
-        info: 'institucional',
-      });
-
-      console.log(`✅ Encontrados ${results.length} resultados`);
-      if (results.length === 0) {
         return {
-          success: true,
-          query,
-          results_count: 0,
-          message:
-            'No se encontraron resultados relevantes en la base de conocimientos.',
+            finalText: 'No pude completar la tarea porque se superó el máximo de pasos de herramientas.',
+            updatedTranscript: transcript,
         };
-      }
-
-      return {
-        success: true,
-        query,
-        results_count: results.length,
-        formatted_results: vectorService.formatResults(results),
-        top_result: {
-          content: results[0].content,
-          similarity: results[0].similarity,
-          metadata: results[0].metadata,
-        },
-      };
-    } catch (error: any) {
-      console.error('Error en búsqueda vectorial:', error);
-      return {
-        success: false,
-        error: error.message,
-        message:
-          'Hubo un error al buscar en la base de conocimientos. Intenta más tarde.',
-      };
-    }
-  }
-
-  private async getPropiedades(query: string, limit = 5) {
-    try {
-      if (!query) return 'Falta query';
-
-      console.log(`🔍 Buscando propiedades: "${query}"`);
-      const results = await vectorService.searchSimilarDocuments(query, limit, {
-        empresa: 'manzotti',
-      });
-
-      console.log(`✅ Encontrados ${results.length} resultados`);
-      if (results.length === 0) {
-        return {
-          success: true,
-          query,
-          results_count: 0,
-          message:
-            'No se encontraron resultados relevantes en la base de conocimientos.',
-        };
-      }
-
-      return {
-        success: true,
-        query,
-        results_count: results.length,
-        formatted_results: vectorService.formatResults(results),
-        top_result: {
-          content: results[0].content,
-          similarity: results[0].similarity,
-          metadata: results[0].metadata,
-        },
-      };
-    } catch (error: any) {
-      console.error('Error en búsqueda vectorial:', error);
-      return {
-        success: false,
-        error: error.message,
-        message:
-          'Hubo un error al buscar en la base de conocimientos. Intenta más tarde.',
-      };
-    }
-  }
-
-  // ---------- Historial / reset ----------
-  async getHistory(userId: string): Promise<any> {
-    const user = await User.findOne({ userId });
-    if (!user || !user.threadId) return { messages: [] };
-    const thread = await Thread.findOne({ threadId: user.threadId });
-    return thread || { messages: [] };
-  }
-
-  async resetThread(userId: string): Promise<string> {
-    const user = await User.findOne({ userId });
-
-    if (user?.threadId) {
-      await Thread.findOneAndUpdate(
-        { threadId: user.threadId },
-        { metadata: { active: false } }
-      );
     }
 
-    const newThreadId = cryptoRandomId();
+    private buildInput(history: DBMessage[], userMessage: string) {
+        const input: any[] = [];
 
-    if (user) {
-      user.threadId = newThreadId;
-      await user.save();
+        if (system_message) {
+            input.push({ role: 'system', content: system_message });
+        }
+
+        for (const m of history) {
+            const base = { role: m.role, content: m.content } as any;
+            if (m.role === 'tool') {
+                if (m.tool_call_id) base.tool_call_id = m.tool_call_id;
+                if (m.name) base.name = m.name;
+            }
+            input.push(base);
+        }
+
+        input.push({ role: 'user', content: userMessage });
+
+        return input;
     }
 
-    await Thread.create({
-      threadId: newThreadId,
-      userId,
-      assistantId: 'responses-api',
-      messages: [],
-    });
+    private async loadHistory(threadId: string, max = 30): Promise<DBMessage[]> {
+        const thread = await Thread.findOne({ threadId });
+        if (!thread) return [];
+        const messages = (thread.messages || []) as DBMessage[];
+        return messages.slice(-max);
+    }
 
-    return newThreadId;
-  }
+    private async appendToThread(threadId: string, messages: DBMessage[]) {
+        await Thread.findOneAndUpdate(
+            { threadId },
+            { $push: { messages: { $each: messages } } },
+            { upsert: true }
+        );
+    }
+
+    private getToolDefs() {
+        return [
+            {
+                type: 'function',
+                name: 'InfoInstitucional',
+                description: 'Busca información institucional sobre servicios, profesionales, matrículas, cobertura médica, responsables, ubicación física, procesos administrativos, horarios de atención y datos de contacto de la empresa Manzotti.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        query: {
+                            type: 'string',
+                            description: 'La consulta de búsqueda. Debe ser específica y descriptiva sobre qué información institucional se necesita.',
+                        },
+                        limit: {
+                            type: 'number',
+                            description: 'Número máximo de resultados a retornar',
+                            default: 5,
+                        },
+                    },
+                    required: ['query'],
+                },
+            },
+            {
+                type: 'function',
+                name: 'Propiedades',
+                description: 'Busca propiedades inmobiliarias disponibles en la base de datos de Manzotti. Usa esta herramienta cuando el usuario pregunte por casas, departamentos, terrenos, alquileres o ventas.',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        query: {
+                            type: 'string',
+                            description: 'Descripción de la propiedad buscada: tipo (casa, depto), ubicación, características, precio, etc.',
+                        },
+                        limit: {
+                            type: 'number',
+                            description: 'Número máximo de resultados a retornar',
+                            default: 5,
+                        },
+                    },
+                    required: ['query'],
+                },
+            },
+        ];
+    }
+
+    private async executeFunction(name: string, args: any): Promise<any> {
+        console.log(`🔧 Ejecutando función: ${name} con parámetros`, args);
+        switch (name) {
+            case 'InfoInstitucional':
+                return this.getInfoInstitucional(args.query, args.limit);
+
+            case 'Propiedades':
+                return this.getPropiedades(args.query, args.limit);
+
+            default:
+                return { error: `Función ${name} no implementada` };
+        }
+    }
+
+    private async getInfoInstitucional(query: string, limit: number = 5) {
+        try {
+            console.log(`🔍 Buscando en knowledge base: "${query}"`);
+            const results = await vectorService.searchSimilarDocuments(query, limit, {
+                empresa: 'manzotti',
+                info: 'institucional',
+            });
+
+            console.log(`✅ Encontrados ${results.length} resultados`);
+            if (results.length === 0) {
+                return {
+                    success: true,
+                    query,
+                    results_count: 0,
+                    message: 'No se encontraron resultados relevantes en la base de conocimientos.',
+                };
+            }
+
+            return {
+                success: true,
+                query,
+                results_count: results.length,
+                formatted_results: vectorService.formatResults(results),
+                top_result: {
+                    content: results[0].content,
+                    similarity: results[0].similarity,
+                    metadata: results[0].metadata,
+                },
+            };
+        } catch (error: any) {
+            console.error('Error en búsqueda vectorial:', error);
+            return {
+                success: false,
+                error: error.message,
+                message: 'Hubo un error al buscar en la base de conocimientos. Intenta más tarde.',
+            };
+        }
+    }
+
+    private async getPropiedades(query: string, limit = 5) {
+        try {
+            if (!query) return 'Falta query';
+
+            console.log(`🔍 Buscando propiedades: "${query}"`);
+            const results = await vectorService.searchSimilarDocuments(query, limit, {
+                empresa: 'manzotti',
+            });
+
+            console.log(`✅ Encontrados ${results.length} resultados`);
+            if (results.length === 0) {
+                return {
+                    success: true,
+                    query,
+                    results_count: 0,
+                    message: 'No se encontraron resultados relevantes en la base de conocimientos.',
+                };
+            }
+
+            return {
+                success: true,
+                query,
+                results_count: results.length,
+                formatted_results: vectorService.formatResults(results),
+                top_result: {
+                    content: results[0].content,
+                    similarity: results[0].similarity,
+                    metadata: results[0].metadata,
+                },
+            };
+        } catch (error: any) {
+            console.error('Error en búsqueda vectorial:', error);
+            return {
+                success: false,
+                error: error.message,
+                message: 'Hubo un error al buscar en la base de conocimientos. Intenta más tarde.',
+            };
+        }
+    }
+
+    async getHistory(userId: string): Promise<any> {
+        const user = await User.findOne({ userId });
+        if (!user || !user.threadId) return { messages: [] };
+        const thread = await Thread.findOne({ threadId: user.threadId });
+        return thread || { messages: [] };
+    }
+
+    async resetThread(userId: string): Promise<string> {
+        const user = await User.findOne({ userId });
+
+        if (user?.threadId) {
+            await Thread.findOneAndUpdate(
+                { threadId: user.threadId },
+                { metadata: { active: false } }
+            );
+        }
+
+        const newThreadId = cryptoRandomId();
+
+        if (user) {
+            user.threadId = newThreadId;
+            await user.save();
+        }
+
+        await Thread.create({
+            threadId: newThreadId,
+            userId,
+            assistantId: 'responses-api',
+            messages: [],
+        });
+
+        return newThreadId;
+    }
 }
 
 // --------- Helpers ---------
 
 function cryptoRandomId() {
-  // ID corto legible; si prefieres ObjectId, usa el de Mongo
-  return 'th_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    return 'th_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-/**
- * Devuelve el texto final de Responses API (si existe).
- * `output_text` es una propiedad de conveniencia del SDK. 
- * Docs: Responses → output_text. 
- */
 function safeOutputText(resp: any): string | null {
-  try {
-    if (resp?.output_text != null) return String(resp.output_text);
-    // Fallback: algunos SDKs exponen `output` con bloques
-    const out = resp?.output;
-    if (Array.isArray(out)) {
-      const textChunks: string[] = [];
-      for (const item of out) {
-        // Node SDK suele poner bloques tipo { type: 'message', content: [{ type:'text', text:'...' }] }
-        if (item?.type === 'message' && Array.isArray(item?.content)) {
-          for (const c of item.content) {
-            if (c?.type === 'text' && typeof c?.text === 'string') {
-              textChunks.push(c.text);
-            }
-          }
+    try {
+        if (resp?.output_text != null) {
+            const s = String(resp.output_text).trim();
+            if (s) return s;
         }
-      }
-      if (textChunks.length) return textChunks.join('\n');
+
+        const out = resp?.output;
+        if (!Array.isArray(out)) return null;
+
+        const chunks: string[] = [];
+
+        for (const item of out) {
+            if (item?.type === 'message' && Array.isArray(item?.content)) {
+                for (const c of item.content) {
+                    if (c?.type === 'output_text') {
+                        const v = typeof c?.text === 'string' ? c.text : 
+                                  typeof c?.text?.value === 'string' ? c.text.value : '';
+                        if (v) chunks.push(v);
+                    }
+
+                    if (c?.type === 'text') {
+                        const v = typeof c?.text === 'string' ? c.text :
+                                  typeof c?.text?.value === 'string' ? c.text.value : '';
+                        if (v) chunks.push(v);
+                    }
+                }
+            }
+
+            if (item?.type === 'output_text') {
+                const v = typeof item?.text === 'string' ? item.text :
+                          typeof item?.text?.value === 'string' ? item.text.value : '';
+                if (v) chunks.push(v);
+            }
+        }
+
+        const joined = chunks.join('\n').trim();
+        return joined || null;
+    } catch {
+        return null;
     }
-  } catch {}
-  return null;
 }
 
-/**
- * Extrae tool calls en varios formatos que el SDK puede devolver en Responses.
- * Estandarizamos a { id, name, arguments }.
- */
 function extractToolCalls(resp: any): Array<{ id: string; name: string; arguments: string }> {
-  const calls: Array<{ id: string; name: string; arguments: string }> = [];
+    const calls: Array<{ id: string; name: string; arguments: string }> = [];
+    
+    console.log('\n🔍 Extracting tool calls from response...');
+    
+    const out = resp?.output;
+    console.log('Output type:', Array.isArray(out) ? `array[${out.length}]` : typeof out);
 
-  // 1) Formato Responses común: output -> blocks -> { type:'tool_call'/'tool_use', id, name, arguments }
-  const out = resp?.output;
-  if (Array.isArray(out)) {
-    for (const item of out) {
-      // Ej: item.type === 'tool_call' | 'tool_use' | 'message'
-      if (item?.type === 'tool_call' || item?.type === 'tool_use') {
-        if (item?.name && item?.id) {
-          calls.push({
-            id: String(item.id),
-            name: String(item.name),
-            arguments: typeof item.arguments === 'string'
-              ? item.arguments
-              : JSON.stringify(item.arguments ?? {}),
-          });
-        }
-      }
-      // Cuando viene como "message" con content blocks
-      if (item?.type === 'message' && Array.isArray(item?.content)) {
-        for (const c of item.content) {
-          if (c?.type === 'tool_call' || c?.type === 'tool_use') {
-            calls.push({
-              id: String(c.id ?? cryptoRandomId()),
-              name: String(c.name),
-              arguments: typeof c.input === 'string'
-                ? c.input
-                : typeof c.arguments === 'string'
-                  ? c.arguments
-                  : JSON.stringify(c.input ?? c.arguments ?? {}),
+    if (Array.isArray(out)) {
+        out.forEach((item, idx) => {
+            console.log(`\n  Item ${idx}:`, {
+                type: item?.type,
+                hasName: !!item?.name,
+                hasCallId: !!item?.call_id,
+                hasArguments: !!item?.arguments,
+                keys: Object.keys(item || {})
             });
-          }
+
+            // Caso 1: function_call (formato Responses API)
+            if (item?.type === 'function_call' && item?.name) {
+                console.log(`    ✅ Found function_call: ${item.name}`);
+                calls.push({
+                    id: String(item?.call_id ?? item?.id ?? cryptoRandomId()),
+                    name: String(item.name),
+                    arguments: typeof item?.arguments === 'string' ? item.arguments :
+                               JSON.stringify(item?.arguments ?? {}),
+                });
+            }
+
+            // Caso 2: tool_use o tool_call
+            if ((item?.type === 'tool_use' || item?.type === 'tool_call') && item?.name) {
+                console.log(`    ✅ Found tool_use: ${item.name}`);
+                calls.push({
+                    id: String(item?.id ?? cryptoRandomId()),
+                    name: String(item.name),
+                    arguments: typeof item?.input === 'string' ? item.input :
+                               typeof item?.arguments === 'string' ? item.arguments :
+                               JSON.stringify(item?.input ?? item?.arguments ?? {}),
+                });
+            }
+
+            // Caso 3: message con content[]
+            if (item?.type === 'message' && Array.isArray(item?.content)) {
+                console.log(`    Message with ${item.content.length} content items`);
+                item.content.forEach((c: any, cidx: number) => {
+                    console.log(`      Content ${cidx}:`, {
+                        type: c?.type,
+                        hasName: !!c?.name,
+                        keys: Object.keys(c || {})
+                    });
+                    
+                    if (c?.type === 'function_call' && c?.name) {
+                        console.log(`      ✅ Found function_call in content: ${c.name}`);
+                        calls.push({
+                            id: String(c?.call_id ?? c?.id ?? cryptoRandomId()),
+                            name: String(c.name),
+                            arguments: typeof c?.arguments === 'string' ? c.arguments :
+                                       JSON.stringify(c?.arguments ?? {}),
+                        });
+                    }
+                    
+                    if ((c?.type === 'tool_use' || c?.type === 'tool_call') && c?.name) {
+                        console.log(`      ✅ Found tool in content: ${c.name}`);
+                        calls.push({
+                            id: String(c?.id ?? cryptoRandomId()),
+                            name: String(c.name),
+                            arguments: typeof c?.input === 'string' ? c.input :
+                                       typeof c?.arguments === 'string' ? c.arguments :
+                                       JSON.stringify(c?.input ?? c?.arguments ?? {}),
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    // Fallback para formato alternativo
+    if (Array.isArray(resp?.tool_calls)) {
+        console.log(`  Found ${resp.tool_calls.length} tool_calls at root level`);
+        for (const t of resp.tool_calls) {
+            calls.push({
+                id: String(t?.id ?? cryptoRandomId()),
+                name: String(t?.function?.name ?? t?.name),
+                arguments: typeof t?.function?.arguments === 'string' ? t.function.arguments :
+                           JSON.stringify(t?.function?.arguments ?? t?.arguments ?? {}),
+            });
         }
-      }
     }
-  }
 
-  // 2) Fallback por si el SDK expone `tool_calls` a nivel raíz (poco común en Responses)
-  if (Array.isArray(resp?.tool_calls)) {
-    for (const t of resp.tool_calls) {
-      calls.push({
-        id: String(t.id ?? cryptoRandomId()),
-        name: String(t.function?.name ?? t.name),
-        arguments:
-          typeof t.function?.arguments === 'string'
-            ? t.function.arguments
-            : JSON.stringify(t.function?.arguments ?? t.arguments ?? {}),
-      });
+    console.log(`\n🎯 Total tool calls found: ${calls.length}`);
+    if (calls.length > 0) {
+        console.log('📋 Tool calls:', calls.map(c => `${c.name}(${c.arguments.substring(0, 50)}...)`));
     }
-  }
-
-  return calls;
+    return calls;
 }
 
 function safeJsonParse(s: any) {
-  if (typeof s !== 'string') return s;
-  try { return JSON.parse(s); } catch { return null; }
+    if (typeof s !== 'string') return s;
+    try { return JSON.parse(s); } catch { return null; }
 }
 
 export default new AssistantService();
