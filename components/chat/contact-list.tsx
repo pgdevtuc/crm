@@ -1,5 +1,5 @@
 "use client"
-import { Search, LogOut, X } from "lucide-react"
+import { Search, LogOut, X, CameraIcon, Mic } from "lucide-react"
 import type { ContactDisplay } from "@/types"
 
 interface ContactListProps {
@@ -85,9 +85,8 @@ export function ContactList({
           <div
             key={contact.id}
             onClick={() => onSelectContact(contact)}
-            className={`flex items-center p-4 cursor-pointer hover:bg-[#f5f6f6] border-b border-[#e9edef] transition-colors ${
-              selectedContact?.id === contact.id ? "bg-[#f0f2f5]" : ""
-            }`}
+            className={`flex items-center p-4 cursor-pointer hover:bg-[#f5f6f6] border-b border-[#e9edef] transition-colors ${selectedContact?.id === contact.id ? "bg-[#f0f2f5]" : ""
+              }`}
           >
             <div className="w-12 h-12 rounded-full bg-[#d9d9d9] flex items-center justify-center text-[#54656f] font-semibold mr-3 flex-shrink-0">
               {contact.avatar}
@@ -97,7 +96,7 @@ export function ContactList({
                 <h3 className="font-semibold text-[#111b21] truncate">{contact.name}</h3>
                 <span className="text-xs text-[#667781] ml-2">{formatDate(contact.timestamp)}</span>
               </div>
-              <p className="text-sm text-[#667781] truncate">{contact.lastMessage}</p>
+              <p className="text-sm text-[#667781] truncate">{contact.lastMessage == '[image]' ? (<><CameraIcon className="w-4 h-4 inline-block" /><p>imagen</p></>) : contact.lastMessage == '[audio]' ? (<><Mic className="w-4 h-4 inline-block" /><p>audio</p></>) : contact.lastMessage}</p>
             </div>
           </div>
         ))}
