@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import assistantService, { AssistantService } from '@/services/assistant.service';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -207,6 +208,21 @@ export async function POST(request: NextRequest) {
       last_message: textBody || (mediaInfo ? `[${type}]` : ''),
       last_message_at: timestampIso,
     }).eq('id', contact.id);
+
+    // Llamar al asistente para responder
+    const responseAssistant = await assistantService.sendMessage(contact.id, textBody);
+
+    const response = await fetch('https://crm-one-flame.vercel.app/api/messages/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contactId: contact.id,
+        message: responseAssistant,
+        to: from,
+      }),
+    })
+
+
 
     return NextResponse.json({ success: true });
   } catch (err) {
