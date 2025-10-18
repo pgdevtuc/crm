@@ -145,7 +145,7 @@ export async function POST(request: NextRequest) {
     if (!contact) {
       const { data: newContact } = await supabase
         .from('contacts')
-        .insert({ phone: from, name: contactName, created_at: new Date().toISOString() })
+        .insert({ phone: from, name: contactName, created_at: new Date().toISOString(), ai_enabled: true })
         .select()
         .single();
       contact = newContact;
@@ -210,6 +210,8 @@ export async function POST(request: NextRequest) {
     }).eq('id', contact.id);
 
     // Llamar al asistente para responder
+    if (!contact.ai_enabled) return NextResponse.json({ success: true });
+
     const responseAssistant = await assistantService.sendMessage(contact.id, textBody);
 
     const response = await fetch('https://crm-one-flame.vercel.app/api/messages/send', {
@@ -222,9 +224,8 @@ export async function POST(request: NextRequest) {
       }),
     })
 
-
-
     return NextResponse.json({ success: true });
+
   } catch (err) {
     console.error('Error processing webhook:', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
