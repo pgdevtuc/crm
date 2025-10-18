@@ -69,7 +69,7 @@ export default function WhatsAppCRM() {
           timestamp: new Date(c.last_message_at || c.created_at),
           unread: 0,
           avatar: (c.name || c.phone).substring(0, 2).toUpperCase(),
-          aiEnabled: c.ai_enabled || false,
+          ai_enabled: c.ai_enabled || false,
         })),
       )
     }
