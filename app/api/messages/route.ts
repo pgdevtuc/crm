@@ -1,10 +1,45 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import type { Contact, Message } from '@/types';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+interface WhatsAppWebhookEntry {
+  id: string;
+  changes: Array<{
+    value: {
+      messaging_product: string;
+      metadata: {
+        display_phone_number: string;
+        phone_number_id: string;
+      };
+      contacts?: Array<{
+        profile: {
+          name: string;
+        };
+        wa_id: string;
+      }>;
+      messages?: Array<{
+        from: string;
+        id: string;
+        timestamp: string;
+        text?: {
+          body: string;
+        };
+        type: string;
+      }>;
+    };
+    field: string;
+  }>;
+}
+
+interface WhatsAppWebhookPayload {
+  object: string;
+  entry: WhatsAppWebhookEntry[];
+}
 
 // Verificación del webhook (GET)
 export async function GET(request: NextRequest) {
@@ -23,7 +58,7 @@ export async function GET(request: NextRequest) {
 // Recibir mensajes (POST)
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
+    const body = await request.json() as WhatsAppWebhookPayload;
 
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
@@ -58,7 +93,11 @@ export async function POST(request: NextRequest) {
         .select()
         .single();
       
-      contact = newContact;
+      contact = newContact as Contact;
+    }
+
+    if (!contact) {
+      throw new Error('Failed to create or find contact');
     }
 
     // Guardar mensaje

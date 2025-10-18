@@ -1,9 +1,16 @@
-// app/page.tsx
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, Phone, Search, MoreVertical, Check, CheckCheck, Menu, X } from 'lucide-react';
-import { createClient } from '@supabase/supabase-js';
+import { Send, Phone, Search, MoreVertical, Check, CheckCheck, Menu, X, LogOut } from 'lucide-react';
+import { createClient, User, RealtimeChannel } from '@supabase/supabase-js';
+import type { 
+  Contact, 
+  ContactDisplay, 
+  Message, 
+  MessageDisplay, 
+  MessageStatus,
+  SendMessageRequest 
+} from '@/types';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -11,36 +18,58 @@ const supabase = createClient(
 );
 
 export default function WhatsAppCRM() {
-  type Contact = {
-    id: string | number;
-    phone: string;
-    name: string;
-    lastMessage: string;
-    timestamp: Date;
-    unread: number;
-    avatar: string;
-  };
-
-  type Message = {
-    id: string | number;
-    text: string;
-    fromMe: boolean;
-    timestamp: Date;
-    status?: string | null;
-  };
-
-  const [contacts, setContacts] = useState<Contact[]>([]);
-  const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
-  const [messages, setMessages] = useState<Record<string | number, Message[]>>({});
+  const [user, setUser] = useState<User | null>(null);
+  const [email, setEmail] = useState<string>('');
+  const [password, setPassword] = useState<string>('');
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [contacts, setContacts] = useState<ContactDisplay[]>([]);
+  const [selectedContact, setSelectedContact] = useState<ContactDisplay | null>(null);
+  const [messages, setMessages] = useState<Record<number, MessageDisplay[]>>({});
   const [messageInput, setMessageInput] = useState<string>('');
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Cargar contactos desde Supabase
+  // Verificar sesión al cargar
   useEffect(() => {
-    loadContacts();
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setIsLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
+
+  // Login
+  const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (error) throw error;
+    } catch (error) {
+      const err = error as Error;
+      alert('Error: ' + err.message);
+    }
+  };
+
+  // Logout
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
+
+  // Cargar contactos
+  useEffect(() => {
+    if (user) {
+      loadContacts();
+    }
+  }, [user]);
 
   const loadContacts = async () => {
     const { data, error } = await supabase
@@ -48,8 +77,14 @@ export default function WhatsAppCRM() {
       .select('*')
       .order('last_message_at', { ascending: false });
 
+    if (error) {
+      console.error('Error loading contacts:', error);
+      return;
+    }
+
     if (data) {
-      setContacts(data.map(c => ({
+      const contactsData = data as Contact[];
+      setContacts(contactsData.map(c => ({
         id: c.id,
         phone: c.phone,
         name: c.name || c.phone,
@@ -61,24 +96,29 @@ export default function WhatsAppCRM() {
     }
   };
 
-  // Cargar mensajes del contacto seleccionado
+  // Cargar mensajes
   useEffect(() => {
-    if (!selectedContact) return;
-
+    if (!selectedContact || !user) return;
     loadMessages(selectedContact.id);
-  }, [selectedContact]);
+  }, [selectedContact, user]);
 
-  const loadMessages = async (contactId: string | number) => {
+  const loadMessages = async (contactId: number) => {
     const { data, error } = await supabase
       .from('messages')
       .select('*')
       .eq('contact_id', contactId)
       .order('timestamp', { ascending: true });
 
+    if (error) {
+      console.error('Error loading messages:', error);
+      return;
+    }
+
     if (data) {
+      const messagesData = data as Message[];
       setMessages(prev => ({
         ...prev,
-        [contactId]: data.map(m => ({
+        [contactId]: messagesData.map(m => ({
           id: m.id,
           text: m.text,
           fromMe: m.from_me,
@@ -89,9 +129,11 @@ export default function WhatsAppCRM() {
     }
   };
 
-  // Suscribirse a cambios en tiempo real
+  // Realtime
   useEffect(() => {
-    const messagesChannel = supabase
+    if (!user) return;
+
+    const messagesChannel: RealtimeChannel = supabase
       .channel('messages-changes')
       .on(
         'postgres_changes',
@@ -101,7 +143,8 @@ export default function WhatsAppCRM() {
           table: 'messages'
         },
         (payload) => {
-          const newMessage = payload.new;
+          console.log('New message received:', payload);
+          const newMessage = payload.new as Message;
           
           setMessages(prev => ({
             ...prev,
@@ -117,13 +160,14 @@ export default function WhatsAppCRM() {
             ]
           }));
 
-          // Recargar contactos para actualizar último mensaje
           loadContacts();
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        console.log('Messages subscription status:', status);
+      });
 
-    const contactsChannel = supabase
+    const contactsChannel: RealtimeChannel = supabase
       .channel('contacts-changes')
       .on(
         'postgres_changes',
@@ -133,18 +177,21 @@ export default function WhatsAppCRM() {
           table: 'contacts'
         },
         () => {
+          console.log('Contacts updated');
           loadContacts();
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        console.log('Contacts subscription status:', status);
+      });
 
     return () => {
       supabase.removeChannel(messagesChannel);
       supabase.removeChannel(contactsChannel);
     };
-  }, []);
+  }, [user]);
 
-  // Scroll al final
+  // Scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, selectedContact]);
@@ -156,35 +203,35 @@ export default function WhatsAppCRM() {
     setMessageInput('');
 
     try {
+      const requestBody: SendMessageRequest = {
+        to: selectedContact.phone,
+        message: messageText,
+        contactId: selectedContact.id
+      };
+
       const response = await fetch('/api/messages/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          to: selectedContact.phone,
-          message: messageText,
-          contactId: selectedContact.id
-        })
+        body: JSON.stringify(requestBody)
       });
 
       if (!response.ok) {
         throw new Error('Failed to send message');
       }
-
-      // El mensaje se agregará automáticamente vía Realtime
     } catch (error) {
       console.error('Error sending message:', error);
       alert('Error al enviar mensaje');
     }
   };
 
-  const formatTime = (date: Date | string) => {
-    return new Date(date).toLocaleTimeString('es-AR', { 
+  const formatTime = (date: Date): string => {
+    return date.toLocaleTimeString('es-AR', { 
       hour: '2-digit', 
       minute: '2-digit' 
     });
   };
 
-  const formatDate = (date: Date | string) => {
+  const formatDate = (date: Date): string => {
     const today = new Date();
     const msgDate = new Date(date);
     
@@ -202,7 +249,11 @@ export default function WhatsAppCRM() {
     return msgDate.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' });
   };
 
-  const MessageStatus = ({ status }: { status: string | null | undefined }) => {
+  interface MessageStatusProps {
+    status: MessageStatus;
+  }
+
+  const MessageStatusIcon: React.FC<MessageStatusProps> = ({ status }) => {
     if (status === 'sent') return <Check className="w-4 h-4 text-gray-400" />;
     if (status === 'delivered') return <CheckCheck className="w-4 h-4 text-gray-400" />;
     if (status === 'read') return <CheckCheck className="w-4 h-4 text-blue-500" />;
@@ -214,19 +265,75 @@ export default function WhatsAppCRM() {
     c.phone.includes(searchTerm)
   );
 
+  // Pantalla de login
+  if (isLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-green-500"></div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-100">
+        <div className="bg-white p-8 rounded-lg shadow-lg w-96">
+          <h1 className="text-2xl font-bold text-center mb-6">WhatsApp CRM</h1>
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Contraseña</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500"
+                required
+              />
+            </div>
+            <button
+              type="submit"
+              className="w-full bg-green-500 text-white py-2 rounded-lg hover:bg-green-600 transition-colors"
+            >
+              Iniciar Sesión
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // Pantalla principal
   return (
     <div className="flex h-screen bg-gray-100">
-      {/* Sidebar - Lista de contactos */}
       <div className={`${isSidebarOpen ? 'w-full md:w-96' : 'w-0'} bg-white border-r border-gray-200 flex flex-col transition-all duration-300 overflow-hidden md:relative absolute z-10 h-full`}>
         <div className="bg-gray-50 p-4 border-b border-gray-200">
           <div className="flex items-center justify-between mb-4">
             <h1 className="text-xl font-semibold text-gray-800">Mensajes</h1>
-            <button 
-              onClick={() => setIsSidebarOpen(false)}
-              className="md:hidden p-2 hover:bg-gray-200 rounded-full"
-            >
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleLogout}
+                className="p-2 hover:bg-gray-200 rounded-full"
+                title="Cerrar sesión"
+              >
+                <LogOut className="w-5 h-5 text-gray-600" />
+              </button>
+              <button 
+                onClick={() => setIsSidebarOpen(false)}
+                className="md:hidden p-2 hover:bg-gray-200 rounded-full"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
           
           <div className="relative">
@@ -256,7 +363,6 @@ export default function WhatsAppCRM() {
               <div className="w-12 h-12 rounded-full bg-gray-300 flex items-center justify-center text-white font-semibold mr-3 flex-shrink-0">
                 {contact.avatar}
               </div>
-
               <div className="flex-1 min-w-0">
                 <div className="flex items-center justify-between mb-1">
                   <h3 className="font-semibold text-gray-900 truncate">{contact.name}</h3>
@@ -269,7 +375,6 @@ export default function WhatsAppCRM() {
         </div>
       </div>
 
-      {/* Chat principal */}
       <div className="flex-1 flex flex-col">
         {selectedContact ? (
           <>
@@ -307,15 +412,13 @@ export default function WhatsAppCRM() {
                   >
                     <div
                       className={`max-w-md px-4 py-2 rounded-lg shadow ${
-                        msg.fromMe
-                          ? 'bg-green-100 text-gray-900'
-                          : 'bg-white text-gray-900'
+                        msg.fromMe ? 'bg-green-100' : 'bg-white'
                       }`}
                     >
                       <p className="text-sm break-words">{msg.text}</p>
                       <div className="flex items-center justify-end mt-1 space-x-1">
                         <span className="text-xs text-gray-500">{formatTime(msg.timestamp)}</span>
-                        {msg.fromMe && <MessageStatus status={msg.status} />}
+                        {msg.fromMe && <MessageStatusIcon status={msg.status} />}
                       </div>
                     </div>
                   </div>

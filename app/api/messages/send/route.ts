@@ -1,14 +1,35 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import type { SendMessageRequest, SendMessageResponse, Message } from '@/types';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+interface WhatsAppSendPayload {
+  messaging_product: string;
+  to: string;
+  type: string;
+  text: {
+    body: string;
+  };
+}
+
+interface WhatsAppSendResponse {
+  messaging_product: string;
+  contacts: Array<{
+    input: string;
+    wa_id: string;
+  }>;
+  messages: Array<{
+    id: string;
+  }>;
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const { to, message, contactId } = await request.json();
+    const { to, message, contactId } = await request.json() as SendMessageRequest;
 
     if (!to || !message) {
       return NextResponse.json(
@@ -18,6 +39,13 @@ export async function POST(request: NextRequest) {
     }
 
     // Enviar mensaje a WhatsApp API
+    const whatsappPayload: WhatsAppSendPayload = {
+      messaging_product: 'whatsapp',
+      to: to,
+      type: 'text',
+      text: { body: message }
+    };
+
     const whatsappResponse = await fetch(
       `https://graph.facebook.com/v18.0/${process.env.WHATSAPP_PHONE_NUMBER_ID}/messages`,
       {
@@ -26,12 +54,7 @@ export async function POST(request: NextRequest) {
           'Authorization': `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to: to,
-          type: 'text',
-          text: { body: message }
-        })
+        body: JSON.stringify(whatsappPayload)
       }
     );
 
@@ -40,7 +63,7 @@ export async function POST(request: NextRequest) {
       throw new Error(`WhatsApp API error: ${JSON.stringify(errorData)}`);
     }
 
-    const whatsappData = await whatsappResponse.json();
+    const whatsappData = await whatsappResponse.json() as WhatsAppSendResponse;
     const messageId = whatsappData.messages[0].id;
 
     // Guardar mensaje en Supabase
@@ -68,16 +91,19 @@ export async function POST(request: NextRequest) {
       })
       .eq('id', contactId);
 
-    return NextResponse.json({ 
-      success: true, 
-      message: savedMessage,
-      whatsappMessageId: messageId 
-    });
+    const response: SendMessageResponse = {
+      success: true,
+      message: savedMessage as Message,
+      whatsappMessageId: messageId
+    };
+
+    return NextResponse.json(response);
   } catch (error) {
     console.error('Error sending message:', error);
-    return NextResponse.json(
-      { error: 'Failed to send message' },
-      { status: 500 }
-    );
+    const errorResponse: SendMessageResponse = {
+      success: false,
+      error: 'Failed to send message'
+    };
+    return NextResponse.json(errorResponse, { status: 500 });
   }
 }
